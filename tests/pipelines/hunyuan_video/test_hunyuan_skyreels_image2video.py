@@ -12,39 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import inspect
 import unittest
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, T5EncoderModel
+from PIL import Image
+from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer, LlamaConfig, LlamaModel, LlamaTokenizer
 
-from diffusers import AutoencoderKL, CogVideoXDDIMScheduler, CogView3PlusPipeline, CogView3PlusTransformer2DModel
-from diffusers.utils.testing_utils import (
-    enable_full_determinism,
-    numpy_cosine_similarity_distance,
-    require_torch_accelerator,
-    slow,
-    torch_device,
+from diffusers import (
+    AutoencoderKLHunyuanVideo,
+    FlowMatchEulerDiscreteScheduler,
+    HunyuanSkyreelsImageToVideoPipeline,
+    HunyuanVideoTransformer3DModel,
 )
+from diffusers.utils.testing_utils import enable_full_determinism, torch_device
 
-from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_IMAGE_PARAMS, TEXT_TO_IMAGE_PARAMS
-from ..test_pipelines_common import (
-    PipelineTesterMixin,
-    to_np,
-)
+from ..test_pipelines_common import PipelineTesterMixin, PyramidAttentionBroadcastTesterMixin, to_np
 
 
 enable_full_determinism()
 
 
-class CogView3PlusPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
-    pipeline_class = CogView3PlusPipeline
-    params = TEXT_TO_IMAGE_PARAMS - {"cross_attention_kwargs"}
-    batch_params = TEXT_TO_IMAGE_BATCH_PARAMS
-    image_params = TEXT_TO_IMAGE_IMAGE_PARAMS
-    image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
+class HunyuanSkyreelsImageToVideoPipelineFastTests(
+    PipelineTesterMixin, PyramidAttentionBroadcastTesterMixin, unittest.TestCase
+):
+    pipeline_class = HunyuanSkyreelsImageToVideoPipeline
+    params = frozenset(
+        ["image", "prompt", "height", "width", "guidance_scale", "prompt_embeds", "pooled_prompt_embeds"]
+    )
+    batch_params = frozenset(["prompt", "image"])
     required_optional_params = frozenset(
         [
             "num_inference_steps",
@@ -55,48 +52,104 @@ class CogView3PlusPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "callback_on_step_end_tensor_inputs",
         ]
     )
+    supports_dduf = False
+
+    # there is no xformers processor for Flux
     test_xformers_attention = False
     test_layerwise_casting = True
     test_group_offloading = True
 
-    def get_dummy_components(self):
+    def get_dummy_components(self, num_layers: int = 1, num_single_layers: int = 1):
         torch.manual_seed(0)
-        transformer = CogView3PlusTransformer2DModel(
-            patch_size=2,
-            in_channels=4,
-            num_layers=1,
-            attention_head_dim=4,
-            num_attention_heads=2,
+        transformer = HunyuanVideoTransformer3DModel(
+            in_channels=8,
             out_channels=4,
-            text_embed_dim=32,  # Must match with tiny-random-t5
-            time_embed_dim=8,
-            condition_dim=2,
-            pos_embed_max_size=8,
-            sample_size=8,
+            num_attention_heads=2,
+            attention_head_dim=10,
+            num_layers=num_layers,
+            num_single_layers=num_single_layers,
+            num_refiner_layers=1,
+            patch_size=1,
+            patch_size_t=1,
+            guidance_embeds=True,
+            text_embed_dim=16,
+            pooled_projection_dim=8,
+            rope_axes_dim=(2, 4, 4),
         )
 
         torch.manual_seed(0)
-        vae = AutoencoderKL(
-            block_out_channels=[32, 64],
+        vae = AutoencoderKLHunyuanVideo(
             in_channels=3,
             out_channels=3,
-            down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
-            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
-            sample_size=128,
+            down_block_types=(
+                "HunyuanVideoDownBlock3D",
+                "HunyuanVideoDownBlock3D",
+                "HunyuanVideoDownBlock3D",
+                "HunyuanVideoDownBlock3D",
+            ),
+            up_block_types=(
+                "HunyuanVideoUpBlock3D",
+                "HunyuanVideoUpBlock3D",
+                "HunyuanVideoUpBlock3D",
+                "HunyuanVideoUpBlock3D",
+            ),
+            block_out_channels=(8, 8, 8, 8),
+            layers_per_block=1,
+            act_fn="silu",
+            norm_num_groups=4,
+            scaling_factor=0.476986,
+            spatial_compression_ratio=8,
+            temporal_compression_ratio=4,
+            mid_block_add_attention=True,
         )
 
         torch.manual_seed(0)
-        scheduler = CogVideoXDDIMScheduler()
-        text_encoder = T5EncoderModel.from_pretrained("hf-internal-testing/tiny-random-t5")
-        tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-t5")
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=7.0)
+
+        llama_text_encoder_config = LlamaConfig(
+            bos_token_id=0,
+            eos_token_id=2,
+            hidden_size=16,
+            intermediate_size=37,
+            layer_norm_eps=1e-05,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            pad_token_id=1,
+            vocab_size=1000,
+            hidden_act="gelu",
+            projection_dim=32,
+        )
+        clip_text_encoder_config = CLIPTextConfig(
+            bos_token_id=0,
+            eos_token_id=2,
+            hidden_size=8,
+            intermediate_size=37,
+            layer_norm_eps=1e-05,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            pad_token_id=1,
+            vocab_size=1000,
+            hidden_act="gelu",
+            projection_dim=32,
+        )
+
+        torch.manual_seed(0)
+        text_encoder = LlamaModel(llama_text_encoder_config)
+        tokenizer = LlamaTokenizer.from_pretrained("finetrainers/dummy-hunyaunvideo", subfolder="tokenizer")
+
+        torch.manual_seed(0)
+        text_encoder_2 = CLIPTextModel(clip_text_encoder_config)
+        tokenizer_2 = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
 
         components = {
             "transformer": transformer,
             "vae": vae,
             "scheduler": scheduler,
             "text_encoder": text_encoder,
+            "text_encoder_2": text_encoder_2,
             "tokenizer": tokenizer,
+            "tokenizer_2": tokenizer_2,
         }
         return components
 
@@ -105,14 +158,24 @@ class CogView3PlusPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             generator = torch.manual_seed(seed)
         else:
             generator = torch.Generator(device=device).manual_seed(seed)
+
+        image_height = 16
+        image_width = 16
+        image = Image.new("RGB", (image_width, image_height))
         inputs = {
+            "image": image,
             "prompt": "dance monkey",
-            "negative_prompt": "",
+            "prompt_template": {
+                "template": "{}",
+                "crop_start": 0,
+            },
             "generator": generator,
             "num_inference_steps": 2,
-            "guidance_scale": 6.0,
+            "guidance_scale": 4.5,
             "height": 16,
             "width": 16,
+            # 4 * k + 1 is the recommendation
+            "num_frames": 9,
             "max_sequence_length": 16,
             "output_type": "pt",
         }
@@ -127,12 +190,12 @@ class CogView3PlusPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         pipe.set_progress_bar_config(disable=None)
 
         inputs = self.get_dummy_inputs(device)
-        image = pipe(**inputs)[0]
-        generated_image = image[0]
+        video = pipe(**inputs).frames
+        generated_video = video[0]
 
-        self.assertEqual(generated_image.shape, (3, 16, 16))
-        expected_image = torch.randn(3, 16, 16)
-        max_diff = np.abs(generated_image - expected_image).max()
+        self.assertEqual(generated_video.shape, (9, 3, 16, 16))
+        expected_video = torch.randn(9, 3, 16, 16)
+        max_diff = np.abs(generated_video - expected_video).max()
         self.assertLessEqual(max_diff, 1e10)
 
     def test_callback_inputs(self):
@@ -194,9 +257,6 @@ class CogView3PlusPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         output = pipe(**inputs)[0]
         assert output.abs().sum() < 1e10
 
-    def test_inference_batch_single_identical(self):
-        self._test_inference_batch_single_identical(batch_size=3, expected_max_diff=1e-3)
-
     def test_attention_slicing_forward_pass(
         self, test_max_difference=True, test_mean_pixel_difference=True, expected_max_diff=1e-3
     ):
@@ -232,43 +292,47 @@ class CogView3PlusPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
                 "Attention slicing should not affect the inference results",
             )
 
-    def test_encode_prompt_works_in_isolation(self):
-        return super().test_encode_prompt_works_in_isolation(atol=1e-3, rtol=1e-3)
+    def test_vae_tiling(self, expected_diff_max: float = 0.2):
+        # Seems to require higher tolerance than the other tests
+        expected_diff_max = 0.6
+        generator_device = "cpu"
+        components = self.get_dummy_components()
 
+        pipe = self.pipeline_class(**components)
+        pipe.to("cpu")
+        pipe.set_progress_bar_config(disable=None)
 
-@slow
-@require_torch_accelerator
-class CogView3PlusPipelineIntegrationTests(unittest.TestCase):
-    prompt = "A painting of a squirrel eating a burger."
+        # Without tiling
+        inputs = self.get_dummy_inputs(generator_device)
+        inputs["height"] = inputs["width"] = 128
+        output_without_tiling = pipe(**inputs)[0]
 
-    def setUp(self):
-        super().setUp()
-        gc.collect()
-        torch.cuda.empty_cache()
+        # With tiling
+        pipe.vae.enable_tiling(
+            tile_sample_min_height=96,
+            tile_sample_min_width=96,
+            tile_sample_stride_height=64,
+            tile_sample_stride_width=64,
+        )
+        inputs = self.get_dummy_inputs(generator_device)
+        inputs["height"] = inputs["width"] = 128
+        output_with_tiling = pipe(**inputs)[0]
 
-    def tearDown(self):
-        super().tearDown()
-        gc.collect()
-        torch.cuda.empty_cache()
+        self.assertLess(
+            (to_np(output_without_tiling) - to_np(output_with_tiling)).max(),
+            expected_diff_max,
+            "VAE tiling should not affect the inference results",
+        )
 
-    def test_cogview3plus(self):
-        generator = torch.Generator("cpu").manual_seed(0)
+    # TODO(aryan): Create a dummy gemma model with smol vocab size
+    @unittest.skip(
+        "A very small vocab size is used for fast tests. So, any kind of prompt other than the empty default used in other tests will lead to a embedding lookup error. This test uses a long prompt that causes the error."
+    )
+    def test_inference_batch_consistent(self):
+        pass
 
-        pipe = CogView3PlusPipeline.from_pretrained("THUDM/CogView3Plus-3b", torch_dtype=torch.float16)
-        pipe.enable_model_cpu_offload(device=torch_device)
-        prompt = self.prompt
-
-        images = pipe(
-            prompt=prompt,
-            height=1024,
-            width=1024,
-            generator=generator,
-            num_inference_steps=2,
-            output_type="np",
-        )[0]
-
-        image = images[0]
-        expected_image = torch.randn(1, 1024, 1024, 3).numpy()
-
-        max_diff = numpy_cosine_similarity_distance(image, expected_image)
-        assert max_diff < 1e-3, f"Max diff is too high. got {image}"
+    @unittest.skip(
+        "A very small vocab size is used for fast tests. So, any kind of prompt other than the empty default used in other tests will lead to a embedding lookup error. This test uses a long prompt that causes the error."
+    )
+    def test_inference_batch_single_identical(self):
+        pass
